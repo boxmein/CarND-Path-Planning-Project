@@ -34,9 +34,21 @@ enum State {
   PREP_LCH_RIGHT,
   LCH_LEFT,
   LCH_RIGHT,
-  STOP,
-  START
+  WAIT_LCH_DONE,
+  STOP
 };
+
+ostream& operator<<(ostream& of, State st) {
+  switch (st) {
+    case KEEP_LANE: return of << "KEEP_LANE"; break;
+    case PREP_LCH_LEFT: return of << "PREP_LCH_LEFT"; break;
+    case PREP_LCH_RIGHT: return of << "PREP_LCH_RIGHT"; break;
+    case LCH_LEFT: return of << "LCH_LEFT"; break;
+    case LCH_RIGHT: return of << "LCH_RIGHT"; break;
+    case STOP: return of << "STOP"; break;
+    default: return of; break;
+  }
+}
 
 // The car's maximum allowed speed in mph
 constexpr double MAX_SPEED = 49.5;
@@ -162,8 +174,9 @@ frPoint getFrenet(double x, double y, double theta, const vector<double> &maps_x
 }
 
 
-// Get the D coordinate for a given lane.
-// The leftmost lane is 0
+// Get the D centerline coordinate for a given lane.
+// The left edge of the lane will be getDForLane(d) - 2
+// The right edge of the lane will be getDForLane(d) + 2
 // Waypoints follow the yellow lines
 // Each lane is 4 m wide, and to stay in the center, you want to add 2 m.
 // The starting lane is second from left (lane = 1)
@@ -172,11 +185,19 @@ double getDForLane(int lane) {
     cout << "Lane is in the opposite direction" << endl;
   }
   
-  return lane * 4 + 2;
+  return 2 + 4 * lane;
 }
 
 int getLaneForD(double d) {
   return round(d / 4.0) - 2;
+}
+
+double msToMph(double ms) {
+  return ms * 2.23694;
+}
+
+double mphToMs(double mph) {
+  return mph / 2.23694;
 }
 
 // Transform world coordinates to car coordinates.
@@ -220,12 +241,18 @@ xyPoint getXY(double s, double d, const vector<double> &maps_s, const vector<dou
 int main() {
   uWS::Hub h;
   
-  // Car state:
+  // Car state
+  enum State state = KEEP_LANE;
+  enum State last_lane_change = PREP_LCH_LEFT;
   
   // The car's target lane.
   int target_lane = 1;
-  // The car's target speed. 50mph is the limit.
-  double target_speed = 0.;
+
+  // The car's set speed. 50mph is the limit.
+  double set_speed = 0.;
+
+  // The car's target speed.
+  double target_speed = MAX_SPEED;
 
   // Load up map values for waypoint's x,y,s and d normalized normal vectors
   vector<double> map_waypoints_x;
@@ -261,8 +288,16 @@ int main() {
   	map_waypoints_dy.push_back(d_y);
   }
   
-  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy,&target_lane,&target_speed](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
-                     uWS::OpCode opCode) {
+  h.onMessage([&map_waypoints_x,
+               &map_waypoints_y,
+               &map_waypoints_s,
+               &map_waypoints_dx,
+               &map_waypoints_dy,
+               &target_lane,
+               &target_speed,
+               &set_speed,
+               &state,
+               &last_lane_change](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length, uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
     // The 2 signifies a websocket event
@@ -290,11 +325,11 @@ int main() {
           	double car_yaw = j[1]["yaw"];
           	double car_speed = j[1]["speed"];
             
-            // True if we are too close to the particular vehicle.
+            // True if we are too close to a vehicle in front.
             bool too_close = false;
             
             // Telemetry!
-            cout << "T x=" << car_x << " y=" << car_y << " s=" << car_s << " d=" << car_d << " yaw=" << car_yaw
+             cout << "T x=" << car_x << " y=" << car_y << " s=" << car_s << " d=" << car_d << " yaw=" << car_yaw
                  << " speed=" << car_speed << endl;
             
 
@@ -333,52 +368,134 @@ int main() {
             double ref_y = car_y;
             double ref_yaw = deg2rad(car_yaw);
             
-            // Simple case of KEEP LANE:
-            // Is there a car in front of us?
-            // Rather... Is there a car in front of our path?
-            
+            // We are actually working on the end of the trajectory, not the car's current location.
+            // This simplifies the problem and lets us anticipate actions ahead.
             if (path_size > 0) {
               car_s = end_path_s;
+              car_d = end_path_d;
             }
             
+            // Keep lane is an action of all states.
             for (int i = 0; i < sensor_fusion.size(); i++) {
               vector<double> sf_car = sensor_fusion[i];
               
               // Car vector: [., ., ., vx, vy, s, d]
               //              0  1  2   3   4  5  6
               double d = sf_car[6];
-              
-              if (d < (2 + 4*target_lane + 2) && d > (2 + 4 * target_lane - 2)) {
-                    double s = sf_car[5];
-                    double vx = sf_car[3];
-                    double vy = sf_car[4];
-                    double v  = sqrt(vx * vx + vy * vy);
-                    
-                    // Extrapolate that the car will be moving linearly in frenet for as long as our path lasts.
-                    s += path_size * .02 * v;
-                    
-                    // If the car is in front of the path and if it's too close,
-                    // reduce the car's target velocity.
-                    if ((s > car_s) && ((s - car_s) < 30)) {
-                      cout << "Car in front! cars=" << car_s << " s=" << s << " card=" << car_d << "d=" << d << endl;
-                      too_close = true;
-                      
-                      if (target_lane != 0) {
-                        target_lane--;
-                      } else if (target_lane != 2) {
-                        target_lane++;
-                      }
-                    }
+              // Simple case of KEEP LANE:
+              // Keep distance with the car in front of us.
+              if (d < (getDForLane(target_lane) + 2) &&
+                  d > (getDForLane(target_lane) - 2)) {
+                double s = sf_car[5];
+                double vx = sf_car[3];
+                double vy = sf_car[4];
+                double v  = sqrt(vx * vx + vy * vy);
+                
+                // Extrapolate that the car will be moving linearly in frenet for as long as our path lasts.
+                s += path_size * .02 * v;
+                
+                // If the car is in front of the path and if it's too close,
+                // reduce the car's target velocity.
+                if ((s > car_s) && ((s - car_s) < 1.2 * mphToMs(car_speed))) {
+                  cout << "Car in front! car_s=" << car_s << " s=" << s << " car_d=" << car_d << "d=" << d << endl;
+                  too_close = true;
+                  // A bit faster than front car when they're far away, quite a bit slower when they're too close.
+                  // Allows time to scope for lane changes.
+                  if ((s - car_s < 18)) {
+                    target_speed = msToMph(v) - 5;
+                  } else {
+                    target_speed = msToMph(v) + 1.;
+                  }
+                }
               }
             }
             
-            if (too_close) {
-              target_speed -= .224;
-            } else if (target_speed < 49.5) {
-              target_speed += .224;
+            // Actuate left lane change for good
+            if (state == LCH_LEFT) {
+              if (target_lane != 0) {
+                target_lane -= 1;
+                last_lane_change = PREP_LCH_LEFT;
+              }
+              state = KEEP_LANE;
             }
             
+            // Actuate right lane change for good
+            else if (state == LCH_RIGHT) {
+              if (target_lane != 2) {
+                target_lane += 1;
+                last_lane_change = PREP_LCH_RIGHT;
+              }
+              state = KEEP_LANE;
+            }
             
+            // prepare lane change left or right
+            else if (state == PREP_LCH_LEFT || state == PREP_LCH_RIGHT) {
+              
+              const string sn = state == PREP_LCH_LEFT ? "Left" : "Right";
+              const int delta = state == PREP_LCH_LEFT ? -1 : 1;
+              // If we find no car on the left we can LCH left
+              if ((state == PREP_LCH_LEFT && target_lane == 0) ||
+                  (state == PREP_LCH_RIGHT && target_lane == 2)) {
+                cout << "PREP_LCH: target lane == " << target_lane << ", no change!" << endl;
+                state = KEEP_LANE;
+              }
+              
+              bool ready_to_change = true;
+              for (int i = 0; i < sensor_fusion.size(); i++) {
+                vector<double> sf_car = sensor_fusion[i];
+                double s = sf_car[5];
+                double vx = sf_car[3];
+                double vy = sf_car[4];
+                double v  = sqrt(vx * vx + vy * vy);
+                
+                // Extrapolate that the car will be moving linearly in frenet for as long as our path lasts.
+                s += path_size * .02 * v;
+                double d = sf_car[6];
+
+                // If the car is in the delta lane,
+                if (d < (getDForLane(target_lane + delta) + 2) &&
+                    d > (getDForLane(target_lane + delta) - 2)) {
+                  
+                  cout << "Car in " << sn << " lane: " << s << "; " << d << " ";
+                  // and the car is less than 10m ahead of us
+                  if (fabs(s - car_s) < 12.) {
+                    cout << "IN THE WAY " << fabs(s - car_s);
+                    ready_to_change = false;
+                  } else {
+                    cout << "OK " << fabs(s - car_s);
+                  }
+                  
+                  cout << endl;
+                }
+              }
+              
+              if (ready_to_change) {
+                cout << "Go go lane " << sn << "!" << endl;
+                state = state == PREP_LCH_LEFT ? LCH_LEFT : LCH_RIGHT;
+              } else {
+                state = KEEP_LANE;
+              }
+            }
+
+            // When in KEEP_LANE, contemplate left/right lane change actions unless still recovering from one.
+            if (too_close) {
+              if (fabs(car_d - getDForLane(target_lane)) < 0.2) {
+                if (target_lane == 2) {
+                  state = PREP_LCH_LEFT;
+                } else if (target_lane == 0) {
+                  state = PREP_LCH_RIGHT;
+                } else {
+                  state = last_lane_change;
+                }
+              } else {
+                target_speed *= .98;
+              }
+            }
+            // When in KEEP_LANE and no car ahead, we can safely drive max speed.
+            else {
+              target_speed = MAX_SPEED;
+            }
+
             // Grab some historical data for the car.
             // This will help in creating a better spline.
             // xref_prev---xref---CAR--->x--->x--->
@@ -416,10 +533,6 @@ int main() {
             
             // Transform the entire current ptsx list to car-local coordinates
             for (int i = 0; i < ptsx.size(); i++) {
-              /*xyPoint t = transformToLocal(ptsx[i], ptsy[i], ref_x, ref_y, ref_yaw);
-              ptsx[i] = t.x;
-              ptsy[i] = t.y; */
-              
               double dx = ptsx[i] - ref_x;
               double dy = ptsy[i] - ref_y;
               
@@ -470,9 +583,17 @@ int main() {
             double x_addon = 0.;
             
             for (int i = 1; i <= (50 - path_size); i++) {
+
+              // Simple controller for target speed matching.
+              if ((target_speed - set_speed) > 0.2) {
+                set_speed += 5 * .02;
+              } else if ((target_speed - set_speed) < -0.2)  {
+                set_speed -= 5 * .02;
+              }
+              
               // Find the number of points to generate in order to get 30m forward:
-              // 30m / (200ms per iteration) * ()(target velocity in mph / 2.24) = (target vel in m/s)).
-              double N = (target_dist / (.02 * target_speed / 2.24));
+              // 30m / (200ms per iteration) * set speed in m/s
+              double N = (target_dist / (.02 * mphToMs(set_speed)));
               
               // The next point will be 30 meters / number of points to the right
               double x_pt = x_addon + target_x / N;
@@ -492,6 +613,8 @@ int main() {
               next_x_vals.push_back(x_pt);
               next_y_vals.push_back(y_pt);
             }
+            
+            cout << "target_speed = " << target_speed << ", target_lane = " << target_lane << ", state = " << state << endl;
             
           	msgJson["next_x"] = next_x_vals;
           	msgJson["next_y"] = next_y_vals;
